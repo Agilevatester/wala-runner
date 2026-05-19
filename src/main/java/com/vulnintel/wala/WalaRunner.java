@@ -53,6 +53,9 @@ import java.util.stream.Collectors;
  * Single-target:
  *   java -jar wala-runner.jar --jar /path/to.jar --target "com.example.Foo.bar"
  *
+ * Multi-jar single-target:
+ *   java -jar wala-runner.jar --jars-file jars.json --target "com.example.Foo.bar"
+ *
  * Batch (build callgraph once, query N targets):
  *   java -jar wala-runner.jar --jar /path/to.jar --targets-file targets.json
  *
@@ -302,7 +305,13 @@ public class WalaRunner {
     /** Single-target analysis — builds context and queries one target. */
     static ObjectNode analyse(String jarPath, String targetFqdn, String algo, int maxDepth)
             throws Exception {
-        CallGraphContext ctx = buildContext(jarPath, algo);
+        return analyse(jarPath, targetFqdn, algo, maxDepth, null);
+    }
+
+    static ObjectNode analyse(String jarPath, String targetFqdn, String algo, int maxDepth,
+                              List<String> classpathJars)
+            throws Exception {
+        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars);
         if (ctx == null) {
             return notReachableNode("No public entry points found in JAR", algo);
         }
@@ -348,6 +357,29 @@ public class WalaRunner {
     }
 
     // ── Daemon mode ───────────────────────────────────────────────────────────
+
+    static ObjectNode analyseAcrossJars(List<String> jarPaths, String targetFqdn, String algo,
+                                        int maxDepth, List<String> classpathJars) {
+        ObjectNode batchResult = JSON.createObjectNode();
+        batchResult.put("batch", true);
+        batchResult.put("multi_jar", true);
+        batchResult.put("target", targetFqdn);
+        ObjectNode results = batchResult.putObject("results");
+
+        for (String jarPath : jarPaths) {
+            if (jarPath == null || jarPath.trim().isEmpty()) {
+                continue;
+            }
+            try {
+                results.set(jarPath, analyse(jarPath, targetFqdn, algo, maxDepth, classpathJars));
+            } catch (Exception ex) {
+                results.set(jarPath, errorNode(
+                        "Analysis failed: " + ex.getClass().getSimpleName() + ": " + ex.getMessage(),
+                        algo));
+            }
+        }
+        return batchResult;
+    }
 
     private static String contextCacheKey(String jarPath, List<String> classpath) {
         if (classpath == null || classpath.isEmpty()) {
@@ -580,6 +612,7 @@ public class WalaRunner {
         }));
 
         String jarPath        = null;
+        String jarsFile       = null;
         String targetFqdn     = null;
         String targetsFile    = null;
         String classpathFile  = null;
@@ -590,6 +623,7 @@ public class WalaRunner {
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--jar":            jarPath       = args[++i]; break;
+                case "--jars-file":      jarsFile      = args[++i]; break;
                 case "--target":         targetFqdn    = args[++i]; break;
                 case "--targets-file":   targetsFile   = args[++i]; break;
                 case "--classpath-file": classpathFile = args[++i]; break;
@@ -608,9 +642,15 @@ public class WalaRunner {
         }
 
         // ── CLI mode ─────────────────────────────────────────────────────────
-        if (jarPath == null || (targetFqdn == null && targetsFile == null)) {
+        if ((jarPath == null && jarsFile == null) || (targetFqdn == null && targetsFile == null)) {
             System.setErr(originalStderr);
-            writeError("Missing required arguments: --jar and (--target or --targets-file)");
+            writeError("Missing required arguments: (--jar or --jars-file) and (--target or --targets-file)");
+            System.exit(1);
+        }
+
+        if (jarsFile != null && targetsFile != null) {
+            System.setErr(originalStderr);
+            writeError("Unsupported argument combination: --jars-file may only be used with --target");
             System.exit(1);
         }
 
@@ -623,7 +663,14 @@ public class WalaRunner {
         }
 
         try {
-            if (targetsFile != null) {
+            if (jarsFile != null) {
+                List<String> jars = JSON.readValue(
+                        new File(jarsFile),
+                        JSON.getTypeFactory().constructCollectionType(List.class, String.class));
+                ObjectNode result = analyseAcrossJars(jars, targetFqdn, algo, maxDepth, classpathJars);
+                System.setErr(originalStderr);
+                System.out.println(JSON.writeValueAsString(result));
+            } else if (targetsFile != null) {
                 List<String> targets = JSON.readValue(
                         new File(targetsFile),
                         JSON.getTypeFactory().constructCollectionType(List.class, String.class));
@@ -631,7 +678,7 @@ public class WalaRunner {
                 System.setErr(originalStderr);
                 System.out.println(JSON.writeValueAsString(result));
             } else {
-                ObjectNode result = analyse(jarPath, targetFqdn, algo, maxDepth);
+                ObjectNode result = analyse(jarPath, targetFqdn, algo, maxDepth, classpathJars);
                 System.setErr(originalStderr);
                 System.out.println(JSON.writeValueAsString(result));
             }
