@@ -29,6 +29,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import com.ibm.wala.types.ClassLoaderReference;
 import com.ibm.wala.types.MethodReference;
 import com.ibm.wala.types.TypeName;
@@ -62,6 +66,7 @@ import java.util.stream.Collectors;
  * Batch + L2 classpath:
  *   java -jar wala-runner.jar --jar /path/to.jar \
  *       --classpath-file /path/classpath.json \   <- ["dep1.jar","dep2.jar",...]
+ *       --classpath-dir /path/to/deps \           <- recursively adds **/*.jar
  *       --targets-file targets.json
  *
  * ── Daemon mode ────────────────────────────────────────────────────────────
@@ -83,6 +88,8 @@ public class WalaRunner {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final int DEFAULT_MAX_DEPTH = 15;
+    private static final double DEFAULT_NOISE_THRESHOLD = 0.20;
+    private static final int DEFAULT_MAX_TRACES = 5;
 
     // ── Daemon context cache ─────────────────────────────────────────────────
     private static final int MAX_CACHED_CONTEXTS = 20;
@@ -140,6 +147,35 @@ public class WalaRunner {
         }
     }
 
+    static final class ResultOptions {
+        final double noiseThreshold;
+        final int maxTraces;
+        final boolean suppressJdkBounce;
+        final boolean primaryJarEntrypointsOnly;
+
+        ResultOptions(double noiseThreshold, int maxTraces,
+                      boolean suppressJdkBounce, boolean primaryJarEntrypointsOnly) {
+            this.noiseThreshold = noiseThreshold;
+            this.maxTraces = maxTraces;
+            this.suppressJdkBounce = suppressJdkBounce;
+            this.primaryJarEntrypointsOnly = primaryJarEntrypointsOnly;
+        }
+    }
+
+    static final class ScoredPath {
+        final List<CGNode> path;
+        final double score;
+
+        ScoredPath(List<CGNode> path, double score) {
+            this.path = path;
+            this.score = score;
+        }
+    }
+
+    private static ResultOptions defaultResultOptions() {
+        return new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true);
+    }
+
     /**
      * Build the analysis scope, class hierarchy, entry points, call graph, and node
      * index for the given JAR.  This is the expensive O(JAR_size) phase shared
@@ -155,7 +191,8 @@ public class WalaRunner {
      * @return null if no public entry points are found.
      */
     static CallGraphContext buildContext(String jarPath, String algo,
-                                        List<String> classpathJars) throws Exception {
+                                        List<String> classpathJars,
+                                        boolean primaryJarEntrypointsOnly) throws Exception {
         // Build classpath string: L1 JAR + optional L2 JARs (path-separator-joined)
         String fullClasspath = jarPath;
         if (classpathJars != null && !classpathJars.isEmpty()) {
@@ -174,13 +211,17 @@ public class WalaRunner {
         // 2. Build class hierarchy
         ClassHierarchy cha = ClassHierarchyFactory.make(scope);
 
-        // 3. Collect entry points — only from the PRIMARY jar (L1) to keep analysis focused.
-        //    We approximate L1 by counting app classes from jarPath alone first.
-        //    Since WALA doesn't expose which JAR a class came from, we collect ALL
-        //    application-loader public methods (the conservative approach).
+        Set<String> primaryJarClasses = primaryJarEntrypointsOnly
+                ? loadPrimaryJarClasses(jarPath)
+                : Collections.emptySet();
+
+        // 3. Collect entry points — prefer only classes defined by the primary jar
+        //    so dependency jars on the application classpath do not become roots.
         List<Entrypoint> entryPoints = new ArrayList<>();
         for (IClass cls : cha) {
             if (!cls.getClassLoader().getReference().equals(ClassLoaderReference.Application))
+                continue;
+            if (primaryJarEntrypointsOnly && !isPrimaryJarClass(cls, primaryJarClasses))
                 continue;
             if (cls.isInterface() || cls.isAbstract()) continue;
             for (IMethod m : cls.getDeclaredMethods()) {
@@ -236,16 +277,107 @@ public class WalaRunner {
                 effectiveAlgo, appClassCount, forcedCha);
     }
 
+    private static Set<String> loadPrimaryJarClasses(String jarPath) throws IOException {
+        Set<String> classes = new HashSet<>();
+        try (JarFile jar = new JarFile(jarPath)) {
+            Enumeration<JarEntry> entries = jar.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = entries.nextElement();
+                String name = entry.getName();
+                if (entry.isDirectory() || !name.endsWith(".class")) {
+                    continue;
+                }
+                if (name.contains("$")) {
+                    name = name.substring(0, name.indexOf('$')) + ".class";
+                }
+                String fqdn = name.substring(0, name.length() - 6).replace('/', '.');
+                classes.add(fqdn);
+            }
+        }
+        return classes;
+    }
+
+    private static boolean isPrimaryJarClass(IClass cls, Set<String> primaryJarClasses) {
+        String className = cls.getName().toString();
+        if (className.startsWith("L")) {
+            className = className.substring(1);
+        }
+        className = className.replace('/', '.');
+        String outerBinaryName = className.contains("$")
+                ? className.substring(0, className.indexOf('$'))
+                : className;
+        String fqdn = className.replace('$', '.');
+        return primaryJarClasses.contains(className)
+                || primaryJarClasses.contains(outerBinaryName)
+                || primaryJarClasses.contains(fqdn);
+    }
+
+    private static List<String> discoverJarFiles(String rootDir) throws IOException {
+        if (rootDir == null || rootDir.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+        Path root = Path.of(rootDir);
+        if (!Files.exists(root) || !Files.isDirectory(root)) {
+            return Collections.emptyList();
+        }
+        try (java.util.stream.Stream<Path> stream = Files.walk(root)) {
+            return stream
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().toLowerCase().endsWith(".jar"))
+                    .map(path -> path.toFile().getAbsolutePath())
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
+    }
+
+    private static List<String> resolveClasspathJars(String classpathFile, List<String> classpathDirs)
+            throws IOException {
+        LinkedHashSet<String> jars = new LinkedHashSet<>();
+        if (classpathFile != null) {
+            jars.addAll(JSON.readValue(
+                    new File(classpathFile),
+                    JSON.getTypeFactory().constructCollectionType(List.class, String.class)));
+        }
+        if (classpathDirs != null) {
+            for (String dir : classpathDirs) {
+                jars.addAll(discoverJarFiles(dir));
+            }
+        }
+        if (jars.isEmpty()) {
+            return null;
+        }
+        return new ArrayList<>(jars);
+    }
+
+    private static List<String> removePrimaryJarFromClasspath(String primaryJar, List<String> classpathJars) {
+        if (primaryJar == null || classpathJars == null || classpathJars.isEmpty()) {
+            return classpathJars;
+        }
+        String normalizedPrimary = new File(primaryJar).getAbsoluteFile().toPath().normalize().toString();
+        List<String> filtered = new ArrayList<>();
+        for (String jar : classpathJars) {
+            if (jar == null || jar.trim().isEmpty()) {
+                continue;
+            }
+            String normalizedCandidate = new File(jar).getAbsoluteFile().toPath().normalize().toString();
+            if (!normalizedPrimary.equals(normalizedCandidate)) {
+                filtered.add(jar);
+            }
+        }
+        return filtered.isEmpty() ? null : filtered;
+    }
+
     /** Backward-compatible overload — no L2 classpath. */
     static CallGraphContext buildContext(String jarPath, String algo) throws Exception {
-        return buildContext(jarPath, algo, null);
+        return buildContext(jarPath, algo, null, true);
     }
 
     /**
      * Query a single target FQDN against a prebuilt CallGraphContext.
      * This is the cheap per-target phase (O(target_lookup + BFS)).
      */
-    static ObjectNode queryTarget(CallGraphContext ctx, String targetFqdn, int maxDepth) {
+    static ObjectNode queryTarget(CallGraphContext ctx, String targetFqdn, int maxDepth,
+                                  ResultOptions options) {
         // 6. Resolve target — two-stage strategy
         MethodReference targetRef  = resolveFqdn(ctx.cha, ctx.scope, targetFqdn);
         CGNode          targetNode = targetRef != null ? ctx.cgNodeIndex.get(targetRef) : null;
@@ -260,9 +392,7 @@ public class WalaRunner {
 
         // 7. Reverse BFS from target + collect paths from entry points
         ReverseReachability reverse = reverseReachability(ctx.cg, targetNode, maxDepth);
-        List<List<CGNode>> reachablePaths = new ArrayList<>();
-        List<CGNode> bestPath = null;
-        double bestScore = -1.0;
+        List<ScoredPath> reachablePaths = new ArrayList<>();
 
         for (Entrypoint ep : ctx.entryPoints) {
             CGNode epNode = ctx.cgNodeIndex.get(ep.getMethod().getReference());
@@ -271,14 +401,9 @@ public class WalaRunner {
 
             List<CGNode> path = buildPathToTarget(epNode, targetNode, reverse.nextHopToTarget);
             if (path != null) {
-                reachablePaths.add(path);
-                // Prefer the path with the highest quality score (fewest JDK
-                // bounce hops, shortest on tie) — mirrors callpath_scorer.best_path().
-                double score = pathScore(path);
-                if (score > bestScore || (score == bestScore && bestPath != null && path.size() < bestPath.size())) {
-                    bestScore = score;
-                    bestPath  = path;
-                }
+                List<CGNode> cleanedPath = trimTrailingNoise(path);
+                double score = pathScore(cleanedPath, targetFqdn);
+                reachablePaths.add(new ScoredPath(cleanedPath, score));
             }
         }
 
@@ -287,7 +412,7 @@ public class WalaRunner {
 
         ObjectNode result;
         if (!reachablePaths.isEmpty()) {
-            result = reachableNode(targetFqdn, bestPath, reachablePaths, sourceLabel, confidence);
+            result = reachableNode(targetFqdn, reachablePaths, sourceLabel, confidence, options);
         } else {
             result = notReachableNode(null, ctx.actualAlgo);
         }
@@ -305,23 +430,25 @@ public class WalaRunner {
     /** Single-target analysis — builds context and queries one target. */
     static ObjectNode analyse(String jarPath, String targetFqdn, String algo, int maxDepth)
             throws Exception {
-        return analyse(jarPath, targetFqdn, algo, maxDepth, null);
+        return analyse(jarPath, targetFqdn, algo, maxDepth, null,
+                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true));
     }
 
     static ObjectNode analyse(String jarPath, String targetFqdn, String algo, int maxDepth,
-                              List<String> classpathJars)
+                              List<String> classpathJars, ResultOptions options)
             throws Exception {
-        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars);
+        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars, options.primaryJarEntrypointsOnly);
         if (ctx == null) {
             return notReachableNode("No public entry points found in JAR", algo);
         }
-        return queryTarget(ctx, targetFqdn, maxDepth);
+        return queryTarget(ctx, targetFqdn, maxDepth, options);
     }
 
     /** Batch analysis — builds context ONCE, then queries all targets (no L2 classpath). */
     static ObjectNode analyseBatch(String jarPath, List<String> targets, String algo, int maxDepth)
             throws Exception {
-        return analyseBatch(jarPath, targets, algo, maxDepth, null);
+        return analyseBatch(jarPath, targets, algo, maxDepth, null,
+                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true));
     }
 
     /**
@@ -330,13 +457,13 @@ public class WalaRunner {
      * (e.g. Keycloak classes referenced in IDS code) are visible to WALA.
      */
     static ObjectNode analyseBatch(String jarPath, List<String> targets, String algo, int maxDepth,
-                                   List<String> classpathJars)
+                                   List<String> classpathJars, ResultOptions options)
             throws Exception {
         ObjectNode batchResult = JSON.createObjectNode();
         batchResult.put("batch", true);
         ObjectNode results = batchResult.putObject("results");
 
-        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars);
+        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars, options.primaryJarEntrypointsOnly);
         if (ctx == null) {
             ObjectNode noEp = notReachableNode("No public entry points found in JAR", algo);
             for (String target : targets) {
@@ -347,7 +474,7 @@ public class WalaRunner {
 
         for (String target : targets) {
             try {
-                results.set(target, queryTarget(ctx, target, maxDepth));
+                results.set(target, queryTarget(ctx, target, maxDepth, options));
             } catch (Exception ex) {
                 results.set(target, errorNode("Query failed: " + ex.getClass().getSimpleName()
                         + ": " + ex.getMessage(), ctx.actualAlgo));
@@ -359,7 +486,8 @@ public class WalaRunner {
     // ── Daemon mode ───────────────────────────────────────────────────────────
 
     static ObjectNode analyseAcrossJars(List<String> jarPaths, String targetFqdn, String algo,
-                                        int maxDepth, List<String> classpathJars) {
+                                        int maxDepth, List<String> classpathJars,
+                                        ResultOptions options) {
         ObjectNode batchResult = JSON.createObjectNode();
         batchResult.put("batch", true);
         batchResult.put("multi_jar", true);
@@ -371,7 +499,7 @@ public class WalaRunner {
                 continue;
             }
             try {
-                results.set(jarPath, analyse(jarPath, targetFqdn, algo, maxDepth, classpathJars));
+                results.set(jarPath, analyse(jarPath, targetFqdn, algo, maxDepth, classpathJars, options));
             } catch (Exception ex) {
                 results.set(jarPath, errorNode(
                         "Analysis failed: " + ex.getClass().getSimpleName() + ": " + ex.getMessage(),
@@ -404,7 +532,7 @@ public class WalaRunner {
      * Concurrent callers for the same key share one CompletableFuture.
      */
     private static CompletableFuture<CallGraphContext> getOrBuildContext(
-            String jarPath, List<String> classpath, String algo) {
+            String jarPath, List<String> classpath, String algo, boolean primaryJarEntrypointsOnly) {
 
         String key = contextCacheKey(jarPath, classpath);
 
@@ -419,9 +547,10 @@ public class WalaRunner {
             final String fJar    = jarPath;
             final List<String> fCp = classpath;
             final String fAlgo   = algo;
+            final boolean fPrimaryOnly = primaryJarEntrypointsOnly;
             EXECUTOR.submit(() -> {
                 try {
-                    CallGraphContext ctx = buildContext(fJar, fAlgo, fCp);
+                    CallGraphContext ctx = buildContext(fJar, fAlgo, fCp, fPrimaryOnly);
                     future.complete(ctx);
                 } catch (Throwable t) {
                     future.completeExceptionally(t);
@@ -456,7 +585,8 @@ public class WalaRunner {
         String algo;
         try {
             ObjectNode req = (ObjectNode) JSON.readTree(bodyBytes);
-            jarPath  = req.required("jar").asText();
+            // "jar" is now optional when sbom_primary is supplied
+            jarPath  = req.has("jar") ? req.get("jar").asText() : null;
             maxDepth = req.has("max_depth") ? req.get("max_depth").asInt(DEFAULT_MAX_DEPTH)
                                             : DEFAULT_MAX_DEPTH;
             algo     = req.has("algo") ? req.get("algo").asText("cha").toLowerCase() : "cha";
@@ -468,9 +598,53 @@ public class WalaRunner {
             if (req.has("classpath")) {
                 for (com.fasterxml.jackson.databind.JsonNode el : req.get("classpath")) classpath.add(el.asText());
             }
+
+            // ── SBOM resolution ───────────────────────────────────────────────
+            if (req.has("sbom_file") || req.has("sbom_purls")) {
+                String sbomCacheStr = req.has("sbom_cache") ? req.get("sbom_cache").asText() : null;
+                java.nio.file.Path cacheDir = sbomCacheStr != null
+                        ? java.nio.file.Paths.get(sbomCacheStr)
+                        : SbomResolver.defaultCacheDir();
+
+                List<SbomResolver.MavenCoord> coords;
+                if (req.has("sbom_file")) {
+                    coords = SbomResolver.parseSbom(
+                            java.nio.file.Paths.get(req.get("sbom_file").asText()));
+                } else {
+                    List<String> purls = new ArrayList<>();
+                    for (com.fasterxml.jackson.databind.JsonNode el : req.get("sbom_purls"))
+                        purls.add(el.asText());
+                    coords = SbomResolver.parsePurls(purls);
+                }
+
+                List<java.nio.file.Path> jars = SbomResolver.resolveJars(coords, cacheDir);
+                String sbomPrimary = req.has("sbom_primary") ? req.get("sbom_primary").asText() : null;
+
+                if (jarPath == null) {
+                    if (sbomPrimary == null)
+                        throw new IllegalArgumentException(
+                            "sbom_primary is required when jar is not specified");
+                    Object[] split = SbomResolver.splitL1L2(coords, jars, sbomPrimary);
+                    java.nio.file.Path l1 = (java.nio.file.Path) split[0];
+                    if (l1 == null)
+                        throw new IllegalArgumentException(
+                            "sbom_primary '" + sbomPrimary + "' not found in SBOM or failed to download");
+                    jarPath = l1.toAbsolutePath().toString();
+                    @SuppressWarnings("unchecked")
+                    List<java.nio.file.Path> l2 = (List<java.nio.file.Path>) split[1];
+                    for (java.nio.file.Path p : l2) classpath.add(p.toAbsolutePath().toString());
+                } else {
+                    for (java.nio.file.Path p : jars) classpath.add(p.toAbsolutePath().toString());
+                }
+            }
         } catch (Exception ex) {
             sendResponse(exchange, 400,
                 "{\"error\":\"Bad request body: " + ex.getMessage().replace("\"", "'") + "\"}");
+            return;
+        }
+
+        if (jarPath == null) {
+            sendResponse(exchange, 400, "{\"error\":\"jar path is required (or provide sbom_file+sbom_primary)\"}");
             return;
         }
 
@@ -505,9 +679,10 @@ public class WalaRunner {
 
         EXECUTOR.submit(() -> {
             try {
-                CompletableFuture<CallGraphContext> ctxFuture = getOrBuildContext(fJarPath, fCp, fAlgo);
+                CompletableFuture<CallGraphContext> ctxFuture = getOrBuildContext(
+                        fJarPath, fCp, fAlgo, defaultResultOptions().primaryJarEntrypointsOnly);
                 CallGraphContext ctx = ctxFuture.get(600, TimeUnit.SECONDS);
-                ObjectNode result = runBatchOnContext(ctx, fTgt, fDepth, fAlgo);
+                ObjectNode result = runBatchOnContext(ctx, fTgt, fDepth, fAlgo, defaultResultOptions());
                 myFuture.complete(result);
             } catch (Throwable t) {
                 myFuture.completeExceptionally(t);
@@ -533,7 +708,7 @@ public class WalaRunner {
     }
 
     private static ObjectNode runBatchOnContext(CallGraphContext ctx,
-            List<String> targets, int maxDepth, String algo) {
+            List<String> targets, int maxDepth, String algo, ResultOptions options) {
         ObjectNode batch = JSON.createObjectNode();
         batch.put("batch", true);
         ObjectNode results = batch.putObject("results");
@@ -545,7 +720,7 @@ public class WalaRunner {
         }
         for (String target : targets) {
             try {
-                results.set(target, queryTarget(ctx, target, maxDepth));
+                results.set(target, queryTarget(ctx, target, maxDepth, options));
             } catch (Exception ex) {
                 results.set(target,
                     errorNode("Query failed: " + ex.getMessage(), ctx.actualAlgo));
@@ -616,9 +791,17 @@ public class WalaRunner {
         String targetFqdn     = null;
         String targetsFile    = null;
         String classpathFile  = null;
+        List<String> classpathDirs = new ArrayList<>();
         String algo           = "cha";
         int    maxDepth       = DEFAULT_MAX_DEPTH;
+        double noiseThreshold = DEFAULT_NOISE_THRESHOLD;
+        int    maxTraces      = DEFAULT_MAX_TRACES;
+        boolean suppressJdkBounce = true;
+        boolean primaryJarEntrypointsOnly = true;
         int    servePort      = -1;
+        String sbomPath       = null;
+        String sbomPrimary    = null;
+        String sbomCacheDir   = null;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -627,9 +810,18 @@ public class WalaRunner {
                 case "--target":         targetFqdn    = args[++i]; break;
                 case "--targets-file":   targetsFile   = args[++i]; break;
                 case "--classpath-file": classpathFile = args[++i]; break;
+                case "--classpath-dir":  classpathDirs.add(args[++i]); break;
                 case "--algo":           algo          = args[++i].toLowerCase(); break;
                 case "--max-depth":      maxDepth      = Integer.parseInt(args[++i]); break;
+                case "--noise-threshold": noiseThreshold = Double.parseDouble(args[++i]); break;
+                case "--max-traces":      maxTraces = Integer.parseInt(args[++i]); break;
+                case "--suppress-jdk-bounce": suppressJdkBounce = Boolean.parseBoolean(args[++i]); break;
+                case "--primary-jar-entrypoints-only": primaryJarEntrypointsOnly = Boolean.parseBoolean(args[++i]); break;
                 case "--serve":          servePort     = Integer.parseInt(args[++i]); break;
+                // SBOM support
+                case "--sbom":           sbomPath      = args[++i]; break;
+                case "--sbom-primary":   sbomPrimary   = args[++i]; break;
+                case "--sbom-cache":     sbomCacheDir  = args[++i]; break;
                 default: break;
             }
         }
@@ -641,10 +833,49 @@ public class WalaRunner {
             return;
         }
 
+        // ── SBOM resolution (CLI mode) ────────────────────────────────────────
+        if (sbomPath != null) {
+            try {
+                java.nio.file.Path cacheDir = sbomCacheDir != null
+                        ? java.nio.file.Paths.get(sbomCacheDir)
+                        : SbomResolver.defaultCacheDir();
+                List<SbomResolver.MavenCoord> coords = SbomResolver.parseSbom(
+                        java.nio.file.Paths.get(sbomPath));
+                List<java.nio.file.Path> jars = SbomResolver.resolveJars(coords, cacheDir);
+
+                if (jarPath == null) {
+                    // No explicit L1 — pick L1 from SBOM using --sbom-primary
+                    if (sbomPrimary == null) {
+                        System.setErr(originalStderr);
+                        writeError("--sbom-primary <group:artifact> is required when --jar is not specified");
+                        System.exit(1);
+                    }
+                    Object[] split = SbomResolver.splitL1L2(coords, jars, sbomPrimary);
+                    java.nio.file.Path l1 = (java.nio.file.Path) split[0];
+                    if (l1 == null) {
+                        System.setErr(originalStderr);
+                        writeError("SBOM primary '" + sbomPrimary + "' not found in SBOM or failed to download");
+                        System.exit(1);
+                    }
+                    jarPath = l1.toAbsolutePath().toString();
+                    @SuppressWarnings("unchecked")
+                    List<java.nio.file.Path> l2 = (List<java.nio.file.Path>) split[1];
+                    for (java.nio.file.Path p : l2) classpathDirs.add(p.getParent().toAbsolutePath().toString());
+                } else {
+                    // Explicit L1 — all SBOM JARs go to L2 classpath
+                    for (java.nio.file.Path p : jars) classpathDirs.add(p.getParent().toAbsolutePath().toString());
+                }
+            } catch (Exception ex) {
+                System.setErr(originalStderr);
+                writeError("SBOM resolution failed: " + ex.getMessage());
+                System.exit(1);
+            }
+        }
+
         // ── CLI mode ─────────────────────────────────────────────────────────
         if ((jarPath == null && jarsFile == null) || (targetFqdn == null && targetsFile == null)) {
             System.setErr(originalStderr);
-            writeError("Missing required arguments: (--jar or --jars-file) and (--target or --targets-file)");
+            writeError("Missing required arguments: (--jar or --jars-file or --sbom+--sbom-primary) and (--target or --targets-file)");
             System.exit(1);
         }
 
@@ -654,31 +885,34 @@ public class WalaRunner {
             System.exit(1);
         }
 
-        // Resolve optional L2 classpath from --classpath-file
-        List<String> classpathJars = null;
-        if (classpathFile != null) {
-            classpathJars = JSON.readValue(
-                new File(classpathFile),
-                JSON.getTypeFactory().constructCollectionType(List.class, String.class));
+        // Resolve optional L2 classpath from explicit JSON entries and/or recursive directories.
+        List<String> classpathJars = resolveClasspathJars(classpathFile, classpathDirs);
+        if (jarPath != null) {
+            classpathJars = removePrimaryJarFromClasspath(jarPath, classpathJars);
         }
+        ResultOptions options = new ResultOptions(
+                noiseThreshold,
+                Math.max(1, maxTraces),
+                suppressJdkBounce,
+                primaryJarEntrypointsOnly);
 
         try {
             if (jarsFile != null) {
                 List<String> jars = JSON.readValue(
                         new File(jarsFile),
                         JSON.getTypeFactory().constructCollectionType(List.class, String.class));
-                ObjectNode result = analyseAcrossJars(jars, targetFqdn, algo, maxDepth, classpathJars);
+                ObjectNode result = analyseAcrossJars(jars, targetFqdn, algo, maxDepth, classpathJars, options);
                 System.setErr(originalStderr);
                 System.out.println(JSON.writeValueAsString(result));
             } else if (targetsFile != null) {
                 List<String> targets = JSON.readValue(
                         new File(targetsFile),
                         JSON.getTypeFactory().constructCollectionType(List.class, String.class));
-                ObjectNode result = analyseBatch(jarPath, targets, algo, maxDepth, classpathJars);
+                ObjectNode result = analyseBatch(jarPath, targets, algo, maxDepth, classpathJars, options);
                 System.setErr(originalStderr);
                 System.out.println(JSON.writeValueAsString(result));
             } else {
-                ObjectNode result = analyse(jarPath, targetFqdn, algo, maxDepth, classpathJars);
+                ObjectNode result = analyse(jarPath, targetFqdn, algo, maxDepth, classpathJars, options);
                 System.setErr(originalStderr);
                 System.out.println(JSON.writeValueAsString(result));
             }
@@ -731,6 +965,12 @@ public class WalaRunner {
         "sun.reflect.", "jdk.internal.reflect."
     );
 
+    /** Logging-framework internals — frequent phantom CHA edges. */
+    private static final List<String> LOGGING_PREFIXES = Arrays.asList(
+        "org.slf4j.", "ch.qos.logback.", "org.apache.logging.",
+        "org.apache.log4j.", "org.apache.commons.logging."
+    );
+
     private static final Set<String> NOISE_METHODS = new HashSet<>(Arrays.asList(
         "toString", "hashCode", "equals", "compareTo", "compareToIgnoreCase",
         "println", "print", "printf", "format",
@@ -739,7 +979,11 @@ public class WalaRunner {
         "finalize", "clone", "wait", "notify", "notifyAll",
         "getClass", "getSimpleName", "getName",
         "write", "flush", "close",
-        "run", "call", "execute"
+        "run", "call", "execute",
+        // Java serialization callbacks — almost always noise in reachability paths
+        "readObject", "writeObject", "readResolve", "writeReplace", "readObjectNoData",
+        // CGLib proxy dispatch
+        "invoke", "invokeSuper", "intercept"
     ));
 
     /**
@@ -748,32 +992,108 @@ public class WalaRunner {
      * pre-selects the best path before serialisation, reducing noise sent over
      * the wire and stored in the DB.
      */
-    private static double pathScore(List<CGNode> path) {
+    private static double pathScore(List<CGNode> path, String targetFqdn) {
         if (path == null || path.isEmpty()) return 0.0;
         double score = 0.50;
         int n = path.size();
-        int jdkCount = 0, reflCount = 0, noiseCount = 0;
+        int jdkCount = 0, reflCount = 0, loggingCount = 0,
+            syntheticCount = 0, noiseCount = 0, samePkgCount = 0;
+        String targetTop = topPackage(targetFqdn, 2);
 
         for (CGNode node : path) {
             String fqdn   = nodeToFqdn(node);
             String method = node.getMethod().getName().toString();
-            boolean isJdk = false;
-            for (String p : JDK_PREFIXES) { if (fqdn.startsWith(p)) { isJdk = true; break; } }
-            boolean isRefl = false;
-            for (String p : REFLECTION_PREFIXES) { if (fqdn.startsWith(p)) { isRefl = true; break; } }
-            if (isJdk)   jdkCount++;
-            if (isRefl)  reflCount++;
-            if (NOISE_METHODS.contains(method)) noiseCount++;
+            if (isJdkFqdn(fqdn))        jdkCount++;
+            if (isReflectionFqdn(fqdn)) reflCount++;
+            if (isLoggingFqdn(fqdn))    loggingCount++;
+            if (isSyntheticMethod(fqdn, method)) syntheticCount++;
+            if (NOISE_METHODS.contains(method))  noiseCount++;
+            if (!targetTop.isEmpty() && fqdn.startsWith(targetTop)) samePkgCount++;
         }
 
         score -= 0.05 * jdkCount;
         score -= 0.05 * reflCount;
+        score -= 0.05 * loggingCount;   // logging internals treated same as JDK bounce
+        score -= 0.08 * syntheticCount; // proxy/lambda — strong signal for spurious CHA edge
         score -= 0.03 * noiseCount;
         if (jdkCount == n) score -= 0.10;
+        if (!targetTop.isEmpty() && samePkgCount == 0) score -= 0.05;
         if (n <= 2)        score += 0.10;
         else if (n <= 4)   score += 0.05;
+        score += 0.05 * Math.min(samePkgCount, 3);
 
         return Math.max(0.0, Math.min(1.0, score));
+    }
+
+    private static boolean isLoggingFqdn(String fqdn) {
+        for (String p : LOGGING_PREFIXES) {
+            if (fqdn.startsWith(p)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Returns true for compiler-generated or proxy methods/classes:
+     *  - lambda desugared:  lambda$methodName$0
+     *  - inner-class bridge: access$000
+     *  - Spring CGLIB proxy: Foo$$EnhancerBySpringCGLIB$$...
+     *  - JDK dynamic proxy:  $Proxy0
+     */
+    private static boolean isSyntheticMethod(String fqdn, String method) {
+        if (method.startsWith("lambda$") || method.startsWith("access$")) return true;
+        // Class portion of the FQDN
+        int dot = fqdn.lastIndexOf('.');
+        String cls = dot >= 0 ? fqdn.substring(0, dot) : fqdn;
+        return cls.contains("$$")
+            || cls.contains("$EnhancerBy")
+            || cls.contains("$FastClassBy")
+            || cls.contains("$Proxy");
+    }
+
+    private static boolean isJdkFqdn(String fqdn) {
+        for (String p : JDK_PREFIXES) {
+            if (fqdn.startsWith(p)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isReflectionFqdn(String fqdn) {
+        for (String p : REFLECTION_PREFIXES) {
+            if (fqdn.startsWith(p)) return true;
+        }
+        return false;
+    }
+
+    private static String topPackage(String fqdn, int depth) {
+        if (fqdn == null || fqdn.isEmpty()) {
+            return "";
+        }
+        String[] parts = fqdn.split("\\.");
+        if (parts.length == 0) {
+            return "";
+        }
+        if (parts.length <= depth) {
+            return fqdn;
+        }
+        return String.join(".", Arrays.copyOfRange(parts, 0, depth));
+    }
+
+    private static List<CGNode> trimTrailingNoise(List<CGNode> path) {
+        if (path == null || path.size() <= 2) {
+            return path;
+        }
+        List<CGNode> trimmed = new ArrayList<>(path);
+        while (trimmed.size() > 2) {
+            CGNode candidate = trimmed.get(trimmed.size() - 2);
+            String fqdn = nodeToFqdn(candidate);
+            String method = candidate.getMethod().getName().toString();
+            if (isJdkFqdn(fqdn) || NOISE_METHODS.contains(method)) {
+                trimmed.remove(trimmed.size() - 2);
+            } else {
+                break;
+            }
+        }
+        return trimmed;
     }
 
     // ── BFS ──────────────────────────────────────────────────────────────────
@@ -991,9 +1311,11 @@ public class WalaRunner {
     }
 
     private static ObjectNode reachableNode(
-            String targetFqdn, List<CGNode> firstPath,
-            List<List<CGNode>> allPaths,
-            String source, double confidence) {
+            String targetFqdn, List<ScoredPath> allPaths,
+            String source, double confidence, ResultOptions options) {
+        List<ScoredPath> rankedPaths = rankPaths(allPaths, targetFqdn, options);
+        ScoredPath first = rankedPaths.get(0);
+        List<CGNode> firstPath = first.path;
 
         ObjectNode node = JSON.createObjectNode();
         node.put("reachable", true);
@@ -1001,6 +1323,7 @@ public class WalaRunner {
         node.put("confidence", confidence);
         node.putNull("error");
         node.put("sink_method", targetFqdn);
+        node.put("call_path_score", roundScore(first.score));
 
         String entryFqdn = firstPath.isEmpty() ? "" : nodeToFqdn(firstPath.get(0));
         node.put("entry_method", entryFqdn);
@@ -1015,7 +1338,8 @@ public class WalaRunner {
         ArrayNode reachArr = node.putArray("reachable_entry_methods");
         ArrayNode sourceArr = node.putArray("reachable_sources");
         Set<String> seenEntries = new HashSet<>();
-        for (List<CGNode> path : allPaths) {
+        for (ScoredPath scoredPath : rankedPaths) {
+            List<CGNode> path = scoredPath.path;
             if (path.isEmpty()) continue;
             String epFqdn = nodeToFqdn(path.get(0));
             if (seenEntries.contains(epFqdn)) continue;
@@ -1026,6 +1350,7 @@ public class WalaRunner {
             int epDot = epFqdn.lastIndexOf('.');
             epNode.put("class",  epDot >= 0 ? epFqdn.substring(0, epDot) : epFqdn);
             epNode.put("method", epDot >= 0 ? epFqdn.substring(epDot + 1) : "");
+            epNode.put("call_path_score", roundScore(scoredPath.score));
             ArrayNode epPathArr = epNode.putArray("call_path");
             for (CGNode n : path) epPathArr.add(nodeToStep(n));
             ArrayNode epRevArr = epNode.putArray("sink_to_source_call_path");
@@ -1036,52 +1361,46 @@ public class WalaRunner {
         return node;
     }
 
-    // ── JSON output helpers ───────────────────────────────────────────────────
-
-    private static void writeError(String msg) {
-        try {
-            ObjectNode node = JSON.createObjectNode();
-            node.put("reachable",        false);
-            node.putNull("entry_method");
-            node.put("analysis_source",  "error");
-            node.put("confidence",       0.0);
-            node.put("error",            msg);
-            node.putArray("call_path");
-            node.putArray("sink_to_source_call_path");
-            node.putArray("reachable_entry_methods");
-            node.putArray("reachable_sources");
-            System.out.println(JSON.writeValueAsString(node));
-        } catch (Exception ignored) {
-            System.out.println("{\"reachable\":false,\"error\":\"" + msg.replace("\"","'") + "\"}");
-        }
+    private static List<ScoredPath> rankPaths(List<ScoredPath> paths, String targetFqdn, ResultOptions options) {
+        return paths.stream()
+            .filter(sp -> sp.score >= options.noiseThreshold)
+            .sorted((a, b) -> {
+                int cmp = Double.compare(b.score, a.score);
+                return cmp != 0 ? cmp : Integer.compare(a.path.size(), b.path.size());
+            })
+            .collect(java.util.stream.Collectors.toList());
     }
 
-        private static String nodeToFqdn(CGNode n) {
+    // ── FQDN / step helpers ──────────────────────────────────────────────────
+
+    private static String nodeToFqdn(CGNode n) {
         IMethod m = n.getMethod();
         String cls = m.getDeclaringClass().getName().toString()
-                .substring(1).replace('/', '.').replace('$', '.');
+                .substring(1).replace('/', '.');
         return cls + "." + m.getName().toString();
     }
 
     private static ObjectNode nodeToStep(CGNode n) {
-        IMethod m = n.getMethod();
-        String fqdn = nodeToFqdn(n);
-        String cls  = m.getDeclaringClass().getName().toString()
-                .substring(1).replace('/', '.').replace('$', '.');
+        IMethod m   = n.getMethod();
+        String  cls = m.getDeclaringClass().getName().toString()
+                        .substring(1).replace('/', '.');
+        String  method = m.getName().toString();
         ObjectNode step = JSON.createObjectNode();
-        step.put("fqdn",         fqdn);
-        step.put("class",        cls);
-        step.put("method",       m.getName().toString());
-        step.put("subsignature", m.getSelector().toString());
+        step.put("fqdn",   cls + "." + method);
+        step.put("class",  cls);
+        step.put("method", method);
         return step;
     }
 
+    // ── Result-node builders ──────────────────────────────────────────────────
+
     private static ObjectNode notReachableNode(String reason, String algo) {
         ObjectNode node = JSON.createObjectNode();
-        node.put("reachable",        false);
-        node.put("analysis_source",  "cha".equals(algo) ? "wala_cha" : "wala_0cfa");
-        node.put("confidence",       0.0);
-        if (reason != null) node.put("error", reason); else node.putNull("error");
+        node.put("reachable",       false);
+        node.putNull("entry_method");
+        node.put("analysis_source", "wala_" + (algo != null ? algo.toLowerCase() : "cha"));
+        node.put("confidence",      0.70);
+        node.put("error",           reason != null ? reason : "not_reachable");
         node.putArray("call_path");
         node.putArray("sink_to_source_call_path");
         node.putArray("reachable_entry_methods");
@@ -1089,12 +1408,13 @@ public class WalaRunner {
         return node;
     }
 
-    private static ObjectNode errorNode(String reason, String algo) {
+    private static ObjectNode errorNode(String msg, String algo) {
         ObjectNode node = JSON.createObjectNode();
         node.put("reachable",       false);
+        node.putNull("entry_method");
         node.put("analysis_source", "error");
         node.put("confidence",      0.0);
-        node.put("error",           reason != null ? reason : "unknown error");
+        node.put("error",           msg);
         node.putArray("call_path");
         node.putArray("sink_to_source_call_path");
         node.putArray("reachable_entry_methods");
