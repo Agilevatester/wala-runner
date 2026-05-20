@@ -199,7 +199,7 @@ curl -s -X POST http://localhost:7071/analyse \
 | `targets` | string[] | Yes | FQDNs to check reachability for. |
 | `max_depth` | int | No | BFS depth limit (default 15). |
 | `algo` | string | No | `cha` (default) or `0cfa`. |
-| `ignore_missing_jars` | bool | No | If `true`, missing/unreadable L2 JARs are skipped with warnings instead of failing the request. |
+| `ignore_missing_jars` | bool | No | Defaults to `true`. If `true`, missing/unreadable L2 JARs are skipped with warnings instead of failing the request. |
 | `sbom_file` | string | No | Absolute path to SBOM file. |
 | `sbom_purls` | string[] | No | Inline list of `pkg:maven/...` purls. |
 | `sbom_primary` | string | No* | `group:artifact` to use as L1 when `jar` is absent. |
@@ -276,7 +276,7 @@ after results are delivered to the platform.
 | `--sbom-primary <g:a>` | — | SBOM component to use as L1 |
 | `--sbom-cache <dir>` | `~/.cache/vuln-intel/jars` | JAR download cache directory |
 | `--algo <cha\|0cfa>` | `cha` | Call-graph algorithm |
-| `--ignore-missing-jars <true\|false>` | `false` | Skip missing/unreadable L2 JARs with warnings instead of failing fast |
+| `--ignore-missing-jars <true\|false>` | `true` | Skip missing/unreadable L2 JARs with warnings instead of failing fast |
 | `--max-depth <n>` | `15` | BFS depth limit |
 | `--noise-threshold <f>` | `0.20` | Minimum path score to report |
 | `--max-traces <n>` | `5` | Max reachable entry methods to report |

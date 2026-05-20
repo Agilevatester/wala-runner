@@ -18,7 +18,6 @@ import com.ibm.wala.ipa.callgraph.impl.DefaultEntrypoint;
 import com.ibm.wala.ipa.callgraph.impl.Util;
 import com.ibm.wala.ipa.cha.ClassHierarchy;
 import com.ibm.wala.ipa.cha.ClassHierarchyFactory;
-import com.ibm.wala.core.util.config.AnalysisScopeReader;
 import com.ibm.wala.core.java11.Java9AnalysisScopeReader;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -31,8 +30,10 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.jar.Manifest;
 import com.ibm.wala.types.ClassLoaderReference;
 import com.ibm.wala.types.MethodReference;
 import com.ibm.wala.types.TypeName;
@@ -179,7 +180,7 @@ public class WalaRunner {
     }
 
     private static ResultOptions defaultResultOptions() {
-        return new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, false);
+        return new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, true);
     }
 
     private static void logInfo(String message) {
@@ -257,6 +258,69 @@ public class WalaRunner {
         return valid;
     }
 
+    private static String normalizeJarPath(String jarPath) {
+        return new File(jarPath).getAbsoluteFile().toPath().normalize().toString();
+    }
+
+    private static List<String> collectManifestClasspathJars(String primaryJar,
+                                                             List<String> directClasspathJars,
+                                                             boolean ignoreMissingClasspathJars) throws IOException {
+        LinkedHashSet<String> resolved = new LinkedHashSet<>();
+        ArrayDeque<String> queue = new ArrayDeque<>();
+        HashSet<String> scanned = new HashSet<>();
+
+        String normalizedPrimary = normalizeJarPath(primaryJar);
+        queue.add(normalizedPrimary);
+        if (directClasspathJars != null) {
+            for (String jar : directClasspathJars) {
+                if (jar == null || jar.trim().isEmpty()) continue;
+                String normalized = normalizeJarPath(jar);
+                if (!normalized.equals(normalizedPrimary) && resolved.add(normalized)) {
+                    queue.add(normalized);
+                }
+            }
+        }
+
+        while (!queue.isEmpty()) {
+            String ownerJar = queue.removeFirst();
+            if (!scanned.add(ownerJar)) {
+                continue;
+            }
+            try (JarFile jarFile = new JarFile(ownerJar)) {
+                Manifest manifest = jarFile.getManifest();
+                if (manifest == null) continue;
+                String classPath = manifest.getMainAttributes().getValue("Class-Path");
+                if (classPath == null || classPath.trim().isEmpty()) continue;
+
+                Path ownerDir = Paths.get(ownerJar).getParent();
+                for (String entry : classPath.trim().split("\\s+")) {
+                    if (entry == null || entry.trim().isEmpty()) continue;
+                    Path candidate = ownerDir != null
+                            ? ownerDir.resolve(entry).normalize()
+                            : Paths.get(entry).normalize();
+                    String candidatePath = candidate.toFile().getAbsolutePath();
+                    try {
+                        validateJarReadable(candidatePath);
+                        if (!candidatePath.equals(normalizedPrimary) && resolved.add(candidatePath)) {
+                            logInfo("Resolved manifest classpath jar '" + candidatePath
+                                    + "' declared by '" + ownerJar + "'");
+                            queue.add(candidatePath);
+                        }
+                    } catch (IOException ex) {
+                        String reason = "Manifest Class-Path jar '" + candidatePath
+                                + "' declared by '" + ownerJar + "' is missing/unreadable";
+                        if (!ignoreMissingClasspathJars) {
+                            throw new IOException(reason, ex);
+                        }
+                        logWarn(reason + ". Ignoring because ignoreMissingClasspathJars=true", ex);
+                    }
+                }
+            }
+        }
+
+        return new ArrayList<>(resolved);
+    }
+
     /**
      * Build the analysis scope, class hierarchy, entry points, call graph, and node
      * index for the given JAR.  This is the expensive O(JAR_size) phase shared
@@ -278,23 +342,24 @@ public class WalaRunner {
         long startedAt = System.nanoTime();
         validateJarReadable(jarPath);
 
-        // Build classpath string: L1 JAR + optional L2 JARs (path-separator-joined)
-        String fullClasspath = jarPath;
-        List<String> sanitizedClasspath = sanitizeClasspathJars(
+        List<String> directClasspath = sanitizeClasspathJars(
                 classpathJars, jarPath, ignoreMissingClasspathJars);
+        List<String> sanitizedClasspath = collectManifestClasspathJars(
+                jarPath, directClasspath, ignoreMissingClasspathJars);
         logInfo("Building context for primary jar '" + jarPath + "' with "
                 + sanitizedClasspath.size() + " validated dependency jars"
                 + (classpathJars == null ? "" : " (requested " + classpathJars.size() + ")")
                 + ", algo=" + algo
                 + ", primaryJarEntrypointsOnly=" + primaryJarEntrypointsOnly
                 + ", ignoreMissingClasspathJars=" + ignoreMissingClasspathJars);
-        if (!sanitizedClasspath.isEmpty()) {
-            fullClasspath += File.pathSeparator + String.join(File.pathSeparator, sanitizedClasspath);
-        }
 
-        // 1. Build analysis scope (L1 + L2 all in Application scope)
-        AnalysisScope scope = new Java9AnalysisScopeReader()
-            .makeJavaBinaryAnalysisScope(fullClasspath, (File) null);
+        // 1. Build analysis scope (L1 + L2 all in Application scope) without
+        // letting WALA auto-follow manifest Class-Path entries opaquely.
+        AnalysisScope scope = new Java9AnalysisScopeReader().makeBasePrimordialScope((File) null);
+        scope.addToScope(ClassLoaderReference.Application, new JarFile(jarPath));
+        for (String depJar : sanitizedClasspath) {
+            scope.addToScope(ClassLoaderReference.Application, new JarFile(depJar));
+        }
 
         // 2. Build class hierarchy
         ClassHierarchy cha = ClassHierarchyFactory.make(scope);
@@ -527,7 +592,7 @@ public class WalaRunner {
     static ObjectNode analyse(String jarPath, String targetFqdn, String algo, int maxDepth)
             throws Exception {
         return analyse(jarPath, targetFqdn, algo, maxDepth, null,
-                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, false));
+                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, true));
     }
 
     static ObjectNode analyse(String jarPath, String targetFqdn, String algo, int maxDepth,
@@ -545,7 +610,7 @@ public class WalaRunner {
     static ObjectNode analyseBatch(String jarPath, List<String> targets, String algo, int maxDepth)
             throws Exception {
         return analyseBatch(jarPath, targets, algo, maxDepth, null,
-                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, false));
+                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, true));
     }
 
     /**
@@ -696,8 +761,8 @@ public class WalaRunner {
             maxDepth = req.has("max_depth") ? req.get("max_depth").asInt(DEFAULT_MAX_DEPTH)
                                             : DEFAULT_MAX_DEPTH;
             algo     = req.has("algo") ? req.get("algo").asText("cha").toLowerCase() : "cha";
-            ignoreMissingClasspathJars = req.has("ignore_missing_jars")
-                    && req.get("ignore_missing_jars").asBoolean(false);
+            ignoreMissingClasspathJars = !req.has("ignore_missing_jars")
+                    || req.get("ignore_missing_jars").asBoolean(true);
             targets  = new ArrayList<>();
             if (req.has("targets")) {
                 for (com.fasterxml.jackson.databind.JsonNode el : req.get("targets")) targets.add(el.asText());
@@ -924,7 +989,7 @@ public class WalaRunner {
         int    maxTraces      = DEFAULT_MAX_TRACES;
         boolean suppressJdkBounce = true;
         boolean primaryJarEntrypointsOnly = true;
-        boolean ignoreMissingClasspathJars = false;
+        boolean ignoreMissingClasspathJars = true;
         int    servePort      = -1;
         String sbomPath       = null;
         String sbomPrimary    = null;
