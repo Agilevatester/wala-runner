@@ -155,13 +155,16 @@ public class WalaRunner {
         final int maxTraces;
         final boolean suppressJdkBounce;
         final boolean primaryJarEntrypointsOnly;
+        final boolean ignoreMissingClasspathJars;
 
         ResultOptions(double noiseThreshold, int maxTraces,
-                      boolean suppressJdkBounce, boolean primaryJarEntrypointsOnly) {
+                      boolean suppressJdkBounce, boolean primaryJarEntrypointsOnly,
+                      boolean ignoreMissingClasspathJars) {
             this.noiseThreshold = noiseThreshold;
             this.maxTraces = maxTraces;
             this.suppressJdkBounce = suppressJdkBounce;
             this.primaryJarEntrypointsOnly = primaryJarEntrypointsOnly;
+            this.ignoreMissingClasspathJars = ignoreMissingClasspathJars;
         }
     }
 
@@ -176,7 +179,7 @@ public class WalaRunner {
     }
 
     private static ResultOptions defaultResultOptions() {
-        return new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true);
+        return new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, false);
     }
 
     private static void logInfo(String message) {
@@ -218,7 +221,9 @@ public class WalaRunner {
         }
     }
 
-    private static List<String> sanitizeClasspathJars(List<String> classpathJars) {
+    private static List<String> sanitizeClasspathJars(List<String> classpathJars,
+                                                      String requiredBy,
+                                                      boolean ignoreMissingClasspathJars) throws IOException {
         if (classpathJars == null || classpathJars.isEmpty()) {
             return Collections.emptyList();
         }
@@ -232,9 +237,13 @@ public class WalaRunner {
                 validateJarReadable(jar);
                 valid.add(jar);
             } catch (IOException ex) {
+                String reason = "Classpath jar '" + jar + "' is missing/unreadable; required by '" + requiredBy + "'";
+                if (!ignoreMissingClasspathJars) {
+                    throw new IOException(reason, ex);
+                }
                 warned++;
                 if (warned <= MAX_LOGGED_JAR_WARNINGS) {
-                    logWarn("Skipping unreadable/corrupted classpath jar '" + jar + "'", ex);
+                    logWarn(reason + ". Ignoring because ignoreMissingClasspathJars=true", ex);
                 }
             }
         }
@@ -264,18 +273,21 @@ public class WalaRunner {
      */
     static CallGraphContext buildContext(String jarPath, String algo,
                                         List<String> classpathJars,
-                                        boolean primaryJarEntrypointsOnly) throws Exception {
+                                        boolean primaryJarEntrypointsOnly,
+                                        boolean ignoreMissingClasspathJars) throws Exception {
         long startedAt = System.nanoTime();
         validateJarReadable(jarPath);
 
         // Build classpath string: L1 JAR + optional L2 JARs (path-separator-joined)
         String fullClasspath = jarPath;
-        List<String> sanitizedClasspath = sanitizeClasspathJars(classpathJars);
+        List<String> sanitizedClasspath = sanitizeClasspathJars(
+                classpathJars, jarPath, ignoreMissingClasspathJars);
         logInfo("Building context for primary jar '" + jarPath + "' with "
                 + sanitizedClasspath.size() + " validated dependency jars"
                 + (classpathJars == null ? "" : " (requested " + classpathJars.size() + ")")
                 + ", algo=" + algo
-                + ", primaryJarEntrypointsOnly=" + primaryJarEntrypointsOnly);
+                + ", primaryJarEntrypointsOnly=" + primaryJarEntrypointsOnly
+                + ", ignoreMissingClasspathJars=" + ignoreMissingClasspathJars);
         if (!sanitizedClasspath.isEmpty()) {
             fullClasspath += File.pathSeparator + String.join(File.pathSeparator, sanitizedClasspath);
         }
@@ -453,7 +465,7 @@ public class WalaRunner {
 
     /** Backward-compatible overload — no L2 classpath. */
     static CallGraphContext buildContext(String jarPath, String algo) throws Exception {
-        return buildContext(jarPath, algo, null, true);
+        return buildContext(jarPath, algo, null, true, false);
     }
 
     /**
@@ -515,13 +527,14 @@ public class WalaRunner {
     static ObjectNode analyse(String jarPath, String targetFqdn, String algo, int maxDepth)
             throws Exception {
         return analyse(jarPath, targetFqdn, algo, maxDepth, null,
-                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true));
+                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, false));
     }
 
     static ObjectNode analyse(String jarPath, String targetFqdn, String algo, int maxDepth,
                               List<String> classpathJars, ResultOptions options)
             throws Exception {
-        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars, options.primaryJarEntrypointsOnly);
+        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars,
+                options.primaryJarEntrypointsOnly, options.ignoreMissingClasspathJars);
         if (ctx == null) {
             return notReachableNode("No public entry points found in JAR", algo);
         }
@@ -532,7 +545,7 @@ public class WalaRunner {
     static ObjectNode analyseBatch(String jarPath, List<String> targets, String algo, int maxDepth)
             throws Exception {
         return analyseBatch(jarPath, targets, algo, maxDepth, null,
-                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true));
+                new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, false));
     }
 
     /**
@@ -547,7 +560,8 @@ public class WalaRunner {
         batchResult.put("batch", true);
         ObjectNode results = batchResult.putObject("results");
 
-        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars, options.primaryJarEntrypointsOnly);
+        CallGraphContext ctx = buildContext(jarPath, algo, classpathJars,
+                options.primaryJarEntrypointsOnly, options.ignoreMissingClasspathJars);
         if (ctx == null) {
             ObjectNode noEp = notReachableNode("No public entry points found in JAR", algo);
             for (String target : targets) {
@@ -593,20 +607,23 @@ public class WalaRunner {
         return batchResult;
     }
 
-    private static String contextCacheKey(String jarPath, List<String> classpath) {
+    private static String contextCacheKey(String jarPath, List<String> classpath,
+                                          boolean ignoreMissingClasspathJars) {
         if (classpath == null || classpath.isEmpty()) {
-            return jarPath;
+            return jarPath + "|ignoreMissing:" + ignoreMissingClasspathJars;
         }
         List<String> sorted = new ArrayList<>(classpath);
         Collections.sort(sorted);
-        return jarPath + "|" + String.join("|", sorted);
+        return jarPath + "|" + String.join("|", sorted)
+                + "|ignoreMissing:" + ignoreMissingClasspathJars;
     }
 
     private static String requestKey(String jarPath, List<String> classpath,
-                                     List<String> targets, int maxDepth) {
+                                     List<String> targets, int maxDepth,
+                                     boolean ignoreMissingClasspathJars) {
         List<String> sortedTargets = new ArrayList<>(targets);
         Collections.sort(sortedTargets);
-        return contextCacheKey(jarPath, classpath)
+        return contextCacheKey(jarPath, classpath, ignoreMissingClasspathJars)
              + "||targets:" + String.join(",", sortedTargets)
              + "||depth:" + maxDepth;
     }
@@ -616,9 +633,10 @@ public class WalaRunner {
      * Concurrent callers for the same key share one CompletableFuture.
      */
     private static CompletableFuture<CallGraphContext> getOrBuildContext(
-            String jarPath, List<String> classpath, String algo, boolean primaryJarEntrypointsOnly) {
+            String jarPath, List<String> classpath, String algo,
+            boolean primaryJarEntrypointsOnly, boolean ignoreMissingClasspathJars) {
 
-        String key = contextCacheKey(jarPath, classpath);
+        String key = contextCacheKey(jarPath, classpath, ignoreMissingClasspathJars);
 
         synchronized (CONTEXT_CACHE) {
             CompletableFuture<CallGraphContext> existing = CONTEXT_CACHE.get(key);
@@ -632,10 +650,11 @@ public class WalaRunner {
             final List<String> fCp = classpath;
             final String fAlgo   = algo;
             final boolean fPrimaryOnly = primaryJarEntrypointsOnly;
+            final boolean fIgnoreMissing = ignoreMissingClasspathJars;
             EXECUTOR.submit(() -> {
                 try {
                     logInfo("Cache miss for context key '" + key + "'");
-                    CallGraphContext ctx = buildContext(fJar, fAlgo, fCp, fPrimaryOnly);
+                    CallGraphContext ctx = buildContext(fJar, fAlgo, fCp, fPrimaryOnly, fIgnoreMissing);
                     future.complete(ctx);
                 } catch (Throwable t) {
                     logError("Context build failed for primary jar '" + fJar + "'", t);
@@ -669,6 +688,7 @@ public class WalaRunner {
         List<String> targets;
         int maxDepth;
         String algo;
+        boolean ignoreMissingClasspathJars;
         try {
             ObjectNode req = (ObjectNode) JSON.readTree(bodyBytes);
             // "jar" is now optional when sbom_primary is supplied
@@ -676,6 +696,8 @@ public class WalaRunner {
             maxDepth = req.has("max_depth") ? req.get("max_depth").asInt(DEFAULT_MAX_DEPTH)
                                             : DEFAULT_MAX_DEPTH;
             algo     = req.has("algo") ? req.get("algo").asText("cha").toLowerCase() : "cha";
+            ignoreMissingClasspathJars = req.has("ignore_missing_jars")
+                    && req.get("ignore_missing_jars").asBoolean(false);
             targets  = new ArrayList<>();
             if (req.has("targets")) {
                 for (com.fasterxml.jackson.databind.JsonNode el : req.get("targets")) targets.add(el.asText());
@@ -741,10 +763,11 @@ public class WalaRunner {
 
         logInfo("Received analyse request for primary jar '" + jarPath + "' with "
                 + classpath.size() + " classpath jars, " + targets.size()
-                + " targets, maxDepth=" + maxDepth + ", algo=" + algo);
+                + " targets, maxDepth=" + maxDepth + ", algo=" + algo
+                + ", ignoreMissingClasspathJars=" + ignoreMissingClasspathJars);
 
         // Deduplication — piggyback on in-flight identical requests
-        String reqKey = requestKey(jarPath, classpath, targets, maxDepth);
+        String reqKey = requestKey(jarPath, classpath, targets, maxDepth, ignoreMissingClasspathJars);
         CompletableFuture<ObjectNode> myFuture = new CompletableFuture<>();
         CompletableFuture<ObjectNode> existing = PENDING_REQUESTS.putIfAbsent(reqKey, myFuture);
 
@@ -766,13 +789,16 @@ public class WalaRunner {
         final List<String> fTgt = targets;
         final int fDepth        = maxDepth;
         final String fAlgo      = algo;
+        final boolean fIgnoreMissing = ignoreMissingClasspathJars;
 
         EXECUTOR.submit(() -> {
             try {
                 CompletableFuture<CallGraphContext> ctxFuture = getOrBuildContext(
-                        fJarPath, fCp, fAlgo, defaultResultOptions().primaryJarEntrypointsOnly);
+                        fJarPath, fCp, fAlgo, defaultResultOptions().primaryJarEntrypointsOnly, fIgnoreMissing);
                 CallGraphContext ctx = ctxFuture.get(600, TimeUnit.SECONDS);
-                ObjectNode result = runBatchOnContext(ctx, fTgt, fDepth, fAlgo, defaultResultOptions());
+                ResultOptions options = new ResultOptions(
+                        DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true, fIgnoreMissing);
+                ObjectNode result = runBatchOnContext(ctx, fTgt, fDepth, fAlgo, options);
                 myFuture.complete(result);
             } catch (Throwable t) {
                 logError("Background analysis failed for primary jar '" + fJarPath + "'", t);
@@ -871,6 +897,15 @@ public class WalaRunner {
         System.out.println(JSON.writeValueAsString(errorNode(msg, "cha")));
     }
 
+    private static boolean parseBooleanFlag(String[] args, int[] indexRef) {
+        int next = indexRef[0] + 1;
+        if (next >= args.length || args[next].startsWith("--")) {
+            return true;
+        }
+        indexRef[0] = next;
+        return Boolean.parseBoolean(args[next]);
+    }
+
     // ── CLI entry point ───────────────────────────────────────────────────────
 
     public static void main(String[] args) throws Exception {
@@ -889,12 +924,14 @@ public class WalaRunner {
         int    maxTraces      = DEFAULT_MAX_TRACES;
         boolean suppressJdkBounce = true;
         boolean primaryJarEntrypointsOnly = true;
+        boolean ignoreMissingClasspathJars = false;
         int    servePort      = -1;
         String sbomPath       = null;
         String sbomPrimary    = null;
         String sbomCacheDir   = null;
 
         for (int i = 0; i < args.length; i++) {
+            int[] indexRef = new int[] { i };
             switch (args[i]) {
                 case "--jar":            jarPath       = args[++i]; break;
                 case "--jars-file":      jarsFile      = args[++i]; break;
@@ -906,8 +943,18 @@ public class WalaRunner {
                 case "--max-depth":      maxDepth      = Integer.parseInt(args[++i]); break;
                 case "--noise-threshold": noiseThreshold = Double.parseDouble(args[++i]); break;
                 case "--max-traces":      maxTraces = Integer.parseInt(args[++i]); break;
-                case "--suppress-jdk-bounce": suppressJdkBounce = Boolean.parseBoolean(args[++i]); break;
-                case "--primary-jar-entrypoints-only": primaryJarEntrypointsOnly = Boolean.parseBoolean(args[++i]); break;
+                case "--suppress-jdk-bounce":
+                    suppressJdkBounce = parseBooleanFlag(args, indexRef);
+                    i = indexRef[0];
+                    break;
+                case "--primary-jar-entrypoints-only":
+                    primaryJarEntrypointsOnly = parseBooleanFlag(args, indexRef);
+                    i = indexRef[0];
+                    break;
+                case "--ignore-missing-jars":
+                    ignoreMissingClasspathJars = parseBooleanFlag(args, indexRef);
+                    i = indexRef[0];
+                    break;
                 case "--serve":          servePort     = Integer.parseInt(args[++i]); break;
                 // SBOM support
                 case "--sbom":           sbomPath      = args[++i]; break;
@@ -981,7 +1028,8 @@ public class WalaRunner {
                 noiseThreshold,
                 Math.max(1, maxTraces),
                 suppressJdkBounce,
-                primaryJarEntrypointsOnly);
+                primaryJarEntrypointsOnly,
+                ignoreMissingClasspathJars);
 
         try {
             if (jarsFile != null) {
