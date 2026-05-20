@@ -1,0 +1,18 @@
+<configuration>
+  <property name="WALA_LOG_LEVEL" value="${WALA_LOG_LEVEL:-INFO}" />
+
+  <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+    <target>System.err</target>
+    <encoder>
+      <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <logger name="com.vulnintel.wala" level="${WALA_LOG_LEVEL}" additivity="false">
+    <appender-ref ref="STDERR" />
+  </logger>
+
+  <root level="WARN">
+    <appender-ref ref="STDERR" />
+  </root>
+</configuration>

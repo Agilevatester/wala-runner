@@ -45,6 +45,7 @@ import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import org.slf4j.LoggerFactory;
 
 /**
  * WalaRunner — CLI entry point invoked by services/analysis/wala_analyzer.py.
@@ -87,9 +88,11 @@ import java.util.stream.Collectors;
 public class WalaRunner {
 
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final org.slf4j.Logger LOG = LoggerFactory.getLogger(WalaRunner.class);
     private static final int DEFAULT_MAX_DEPTH = 15;
     private static final double DEFAULT_NOISE_THRESHOLD = 0.20;
     private static final int DEFAULT_MAX_TRACES = 5;
+    private static final int MAX_LOGGED_JAR_WARNINGS = 10;
 
     // Daemon context cache:
     private static final int MAX_CACHED_CONTEXTS = 20;
@@ -176,6 +179,75 @@ public class WalaRunner {
         return new ResultOptions(DEFAULT_NOISE_THRESHOLD, DEFAULT_MAX_TRACES, true, true);
     }
 
+    private static void logInfo(String message) {
+        LOG.info(message);
+    }
+
+    private static void logWarn(String message) {
+        LOG.warn(message);
+    }
+
+    private static void logWarn(String message, Throwable error) {
+        LOG.warn(message, error);
+    }
+
+    private static void logError(String message, Throwable error) {
+        LOG.error(message, error);
+    }
+
+    private static void validateJarReadable(String jarPath) throws IOException {
+        File jarFile = new File(jarPath);
+        if (!jarFile.exists()) {
+            throw new IOException("JAR does not exist");
+        }
+        if (!jarFile.isFile()) {
+            throw new IOException("Path is not a regular file");
+        }
+        try (JarFile jar = new JarFile(jarFile)) {
+            byte[] buffer = new byte[8192];
+            Enumeration<JarEntry> entries = jar.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = entries.nextElement();
+                if (entry.isDirectory()) continue;
+                try (InputStream in = jar.getInputStream(entry)) {
+                    while (in.read(buffer) != -1) {
+                        // Drain each entry so JarFile surfaces truncation/CRC issues early.
+                    }
+                }
+            }
+        }
+    }
+
+    private static List<String> sanitizeClasspathJars(List<String> classpathJars) {
+        if (classpathJars == null || classpathJars.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> valid = new ArrayList<>();
+        int warned = 0;
+        for (String jar : classpathJars) {
+            if (jar == null || jar.trim().isEmpty()) {
+                continue;
+            }
+            try {
+                validateJarReadable(jar);
+                valid.add(jar);
+            } catch (IOException ex) {
+                warned++;
+                if (warned <= MAX_LOGGED_JAR_WARNINGS) {
+                    logWarn("Skipping unreadable/corrupted classpath jar '" + jar + "'", ex);
+                }
+            }
+        }
+        int skipped = classpathJars.size() - valid.size();
+        if (skipped > warned) {
+            logWarn("Skipped " + skipped + " unreadable/corrupted classpath jars; only the first "
+                    + warned + " were logged individually");
+        } else if (skipped > 0) {
+            logWarn("Skipped " + skipped + " unreadable/corrupted classpath jars during scope build");
+        }
+        return valid;
+    }
+
     /**
      * Build the analysis scope, class hierarchy, entry points, call graph, and node
      * index for the given JAR.  This is the expensive O(JAR_size) phase shared
@@ -193,15 +265,19 @@ public class WalaRunner {
     static CallGraphContext buildContext(String jarPath, String algo,
                                         List<String> classpathJars,
                                         boolean primaryJarEntrypointsOnly) throws Exception {
+        long startedAt = System.nanoTime();
+        validateJarReadable(jarPath);
+
         // Build classpath string: L1 JAR + optional L2 JARs (path-separator-joined)
         String fullClasspath = jarPath;
-        if (classpathJars != null && !classpathJars.isEmpty()) {
-            List<String> existing = classpathJars.stream()
-                .filter(s -> s != null && new File(s).exists())
-                .collect(Collectors.toList());
-            if (!existing.isEmpty()) {
-                fullClasspath += File.pathSeparator + String.join(File.pathSeparator, existing);
-            }
+        List<String> sanitizedClasspath = sanitizeClasspathJars(classpathJars);
+        logInfo("Building context for primary jar '" + jarPath + "' with "
+                + sanitizedClasspath.size() + " validated dependency jars"
+                + (classpathJars == null ? "" : " (requested " + classpathJars.size() + ")")
+                + ", algo=" + algo
+                + ", primaryJarEntrypointsOnly=" + primaryJarEntrypointsOnly);
+        if (!sanitizedClasspath.isEmpty()) {
+            fullClasspath += File.pathSeparator + String.join(File.pathSeparator, sanitizedClasspath);
         }
 
         // 1. Build analysis scope (L1 + L2 all in Application scope)
@@ -249,6 +325,8 @@ public class WalaRunner {
         if ("0cfa".equals(algo) && appClassCount > ZERO_CFA_CLASS_LIMIT) {
             effectiveAlgo = "cha";
             forcedCha = true;
+            logWarn("Forcing algo=cha for primary jar '" + jarPath + "' because application class count "
+                    + appClassCount + " exceeds limit " + ZERO_CFA_CLASS_LIMIT);
         }
 
         // 4. Build call graph
@@ -272,6 +350,11 @@ public class WalaRunner {
         for (CGNode n : cg) {
             cgNodeIndex.put(n.getMethod().getReference(), n);
         }
+
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+        logInfo("Built context for primary jar '" + jarPath + "' in " + elapsedMs + " ms"
+                + " with " + appClassCount + " application classes, "
+                + entryPoints.size() + " entry points, and algo=" + effectiveAlgo);
 
         return new CallGraphContext(scope, cha, entryPoints, cg, cgNodeIndex,
                 effectiveAlgo, appClassCount, forcedCha);
@@ -346,6 +429,7 @@ public class WalaRunner {
         if (jars.isEmpty()) {
             return null;
         }
+        logInfo("Resolved " + jars.size() + " classpath jar candidates");
         return new ArrayList<>(jars);
     }
 
@@ -550,9 +634,11 @@ public class WalaRunner {
             final boolean fPrimaryOnly = primaryJarEntrypointsOnly;
             EXECUTOR.submit(() -> {
                 try {
+                    logInfo("Cache miss for context key '" + key + "'");
                     CallGraphContext ctx = buildContext(fJar, fAlgo, fCp, fPrimaryOnly);
                     future.complete(ctx);
                 } catch (Throwable t) {
+                    logError("Context build failed for primary jar '" + fJar + "'", t);
                     future.completeExceptionally(t);
                     synchronized (CONTEXT_CACHE) {
                         CONTEXT_CACHE.remove(key, future);
@@ -653,6 +739,10 @@ public class WalaRunner {
             return;
         }
 
+        logInfo("Received analyse request for primary jar '" + jarPath + "' with "
+                + classpath.size() + " classpath jars, " + targets.size()
+                + " targets, maxDepth=" + maxDepth + ", algo=" + algo);
+
         // Deduplication — piggyback on in-flight identical requests
         String reqKey = requestKey(jarPath, classpath, targets, maxDepth);
         CompletableFuture<ObjectNode> myFuture = new CompletableFuture<>();
@@ -685,6 +775,7 @@ public class WalaRunner {
                 ObjectNode result = runBatchOnContext(ctx, fTgt, fDepth, fAlgo, defaultResultOptions());
                 myFuture.complete(result);
             } catch (Throwable t) {
+                logError("Background analysis failed for primary jar '" + fJarPath + "'", t);
                 myFuture.completeExceptionally(t);
             } finally {
                 PENDING_REQUESTS.remove(reqKey, myFuture);
@@ -786,12 +877,6 @@ public class WalaRunner {
         Logger.getLogger("com.ibm.wala").setLevel(Level.SEVERE);
         Logger.getLogger("").setLevel(Level.SEVERE);
 
-        java.io.PrintStream originalStderr = System.err;
-        System.setErr(new java.io.PrintStream(new java.io.OutputStream() {
-            @Override public void write(int b) {}
-            @Override public void write(byte[] b, int off, int len) {}
-        }));
-
         String jarPath        = null;
         String jarsFile       = null;
         String targetFqdn     = null;
@@ -834,7 +919,6 @@ public class WalaRunner {
 
         // ── Daemon mode ──────────────────────────────────────────────────────
         if (servePort > 0) {
-            System.setErr(originalStderr);
             startDaemon(servePort);
             return;
         }
@@ -852,14 +936,12 @@ public class WalaRunner {
                 if (jarPath == null) {
                     // No explicit L1 — pick L1 from SBOM using --sbom-primary
                     if (sbomPrimary == null) {
-                        System.setErr(originalStderr);
                         writeError("--sbom-primary <group:artifact> is required when --jar is not specified");
                         System.exit(1);
                     }
                     Object[] split = SbomResolver.splitL1L2(coords, jars, sbomPrimary);
                     java.nio.file.Path l1 = (java.nio.file.Path) split[0];
                     if (l1 == null) {
-                        System.setErr(originalStderr);
                         writeError("SBOM primary '" + sbomPrimary + "' not found in SBOM or failed to download");
                         System.exit(1);
                     }
@@ -872,7 +954,6 @@ public class WalaRunner {
                     for (java.nio.file.Path p : jars) classpathDirs.add(p.getParent().toAbsolutePath().toString());
                 }
             } catch (Exception ex) {
-                System.setErr(originalStderr);
                 writeError("SBOM resolution failed: " + ex.getMessage());
                 System.exit(1);
             }
@@ -880,13 +961,11 @@ public class WalaRunner {
 
         // ── CLI mode ─────────────────────────────────────────────────────────
         if ((jarPath == null && jarsFile == null) || (targetFqdn == null && targetsFile == null)) {
-            System.setErr(originalStderr);
             writeError("Missing required arguments: (--jar or --jars-file or --sbom+--sbom-primary) and (--target or --targets-file)");
             System.exit(1);
         }
 
         if (jarsFile != null && targetsFile != null) {
-            System.setErr(originalStderr);
             writeError("Unsupported argument combination: --jars-file may only be used with --target");
             System.exit(1);
         }
@@ -896,6 +975,8 @@ public class WalaRunner {
         if (jarPath != null) {
             classpathJars = removePrimaryJarFromClasspath(jarPath, classpathJars);
         }
+        logInfo("CLI resolved " + (classpathJars == null ? 0 : classpathJars.size())
+                + " candidate classpath jars after removing the primary jar");
         ResultOptions options = new ResultOptions(
                 noiseThreshold,
                 Math.max(1, maxTraces),
@@ -908,22 +989,18 @@ public class WalaRunner {
                         new File(jarsFile),
                         JSON.getTypeFactory().constructCollectionType(List.class, String.class));
                 ObjectNode result = analyseAcrossJars(jars, targetFqdn, algo, maxDepth, classpathJars, options);
-                System.setErr(originalStderr);
                 System.out.println(JSON.writeValueAsString(result));
             } else if (targetsFile != null) {
                 List<String> targets = JSON.readValue(
                         new File(targetsFile),
                         JSON.getTypeFactory().constructCollectionType(List.class, String.class));
                 ObjectNode result = analyseBatch(jarPath, targets, algo, maxDepth, classpathJars, options);
-                System.setErr(originalStderr);
                 System.out.println(JSON.writeValueAsString(result));
             } else {
                 ObjectNode result = analyse(jarPath, targetFqdn, algo, maxDepth, classpathJars, options);
-                System.setErr(originalStderr);
                 System.out.println(JSON.writeValueAsString(result));
             }
         } catch (Exception ex) {
-            System.setErr(originalStderr);
             writeError("Analysis failed: " + ex.getClass().getSimpleName() + ": " + ex.getMessage());
             System.exit(0);
         }
