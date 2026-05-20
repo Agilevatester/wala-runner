@@ -52,7 +52,7 @@ import java.util.stream.Collectors;
  * Produces the same JSON schema as SootUpRunner so the Python dispatcher can
  * treat both interchangeably or merge their results.
  *
- * ── CLI modes ──────────────────────────────────────────────────────────────
+ * CLI modes:
  *
  * Single-target:
  *   java -jar wala-runner.jar --jar /path/to.jar --target "com.example.Foo.bar"
@@ -66,10 +66,10 @@ import java.util.stream.Collectors;
  * Batch + L2 classpath:
  *   java -jar wala-runner.jar --jar /path/to.jar \
  *       --classpath-file /path/classpath.json \   <- ["dep1.jar","dep2.jar",...]
- *       --classpath-dir /path/to/deps \           <- recursively adds **/*.jar
+ *       --classpath-dir /path/to/deps \           <- recursively adds **\/*.jar
  *       --targets-file targets.json
  *
- * ── Daemon mode ────────────────────────────────────────────────────────────
+ * Daemon mode:
  *
  *   java -jar wala-runner.jar --serve 7071
  *
@@ -91,7 +91,7 @@ public class WalaRunner {
     private static final double DEFAULT_NOISE_THRESHOLD = 0.20;
     private static final int DEFAULT_MAX_TRACES = 5;
 
-    // ── Daemon context cache ─────────────────────────────────────────────────
+    // Daemon context cache:
     private static final int MAX_CACHED_CONTEXTS = 20;
 
     /**
@@ -774,6 +774,12 @@ public class WalaRunner {
         } catch (InterruptedException ignored) {}
     }
 
+
+    
+    private static void writeError(String msg) throws Exception {
+        System.out.println(JSON.writeValueAsString(errorNode(msg, "cha")));
+    }
+
     // ── CLI entry point ───────────────────────────────────────────────────────
 
     public static void main(String[] args) throws Exception {
@@ -1023,6 +1029,10 @@ public class WalaRunner {
         score += 0.05 * Math.min(samePkgCount, 3);
 
         return Math.max(0.0, Math.min(1.0, score));
+    }
+
+    private static double roundScore(double score) {
+        return Math.round(score * 1000.0) / 1000.0;
     }
 
     private static boolean isLoggingFqdn(String fqdn) {
